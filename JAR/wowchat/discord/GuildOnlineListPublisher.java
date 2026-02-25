@@ -18,7 +18,10 @@
  * 4. Message marker changed to a single recognizable invisible char sequence.
  *    Functionally identical to original but easier to reason about.
  *
- * 5. No logic changes to the core update/edit/find cycle — that part was correct.
+ * 5. Each entry now shows full info matching the ?online command format:
+ *    "Symastic (40 Warrior in Stranglethorn Vale)"
+ *    Uses the same Classes().valueOf() and GameResources$.AREA() lookups
+ *    that GamePacketHandler uses for ?online.
  *
  * NOTE ON THE REFLECTION HACK:
  *    The JDA field in Discord.java is private with no public accessor. Since we're
@@ -40,7 +43,9 @@ import scala.collection.mutable.Map;
 import wowchat.common.Global$;
 import wowchat.game.GameCommandHandler;
 import wowchat.game.GamePacketHandler;
+import wowchat.game.GameResources$;
 import wowchat.game.GuildMember;
+import scala.runtime.BoxesRunTime;
 
 import java.io.File;
 import java.lang.reflect.Field;
@@ -177,7 +182,10 @@ public final class GuildOnlineListPublisher {
     }
 
     // -------------------------------------------------------------------------
-    // Get list of online guild member names (excluding ignored names)
+    // Get list of online guild member entries, formatted to match ?online output:
+    //   "Symastic (40 Warrior in Stranglethorn Vale)"
+    // Uses the same Classes().valueOf() and GameResources$.AREA() lookups
+    // that GamePacketHandler.buildGuildiesOnline() uses for the ?online command.
     // -------------------------------------------------------------------------
 
     private static List<String> getOnlineNames() {
@@ -188,7 +196,8 @@ public final class GuildOnlineListPublisher {
             GameCommandHandler handler = gameOpt.get();
             if (!(handler instanceof GamePacketHandler)) return Collections.emptyList();
 
-            Map<Object, GuildMember> roster = ((GamePacketHandler) handler).guildRoster();
+            GamePacketHandler gameHandler = (GamePacketHandler) handler;
+            Map<Object, GuildMember> roster = gameHandler.guildRoster();
             if (roster == null) return Collections.emptyList();
 
             List<String> result = new ArrayList<>();
@@ -208,7 +217,25 @@ public final class GuildOnlineListPublisher {
                 if (!ignoreLower.isEmpty()
                         && ignoreLower.contains(trimmed.toLowerCase(Locale.ROOT))) continue;
 
-                result.add(trimmed);
+                // Resolve class name — same call as GamePacketHandler.buildGuildiesOnline()
+                String className;
+                try {
+                    className = gameHandler.Classes().valueOf(member.charClass()).toString();
+                } catch (Throwable t) {
+                    className = "Unknown";
+                }
+
+                // Resolve zone name — same call as GamePacketHandler.buildGuildiesOnline()
+                String zoneName;
+                try {
+                    zoneName = (String) GameResources$.MODULE$.AREA()
+                        .getOrElse(BoxesRunTime.boxToInteger(member.zoneId()), () -> "Unknown Zone");
+                } catch (Throwable t) {
+                    zoneName = "Unknown Zone";
+                }
+
+                // Format: "Symastic (40 Warrior in Stranglethorn Vale)"
+                result.add(trimmed + " (" + member.level() + " " + className + " in " + zoneName + ")");
             }
 
             return result;
