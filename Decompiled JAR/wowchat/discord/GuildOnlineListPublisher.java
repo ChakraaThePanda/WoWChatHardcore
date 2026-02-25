@@ -38,18 +38,14 @@ import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.User;
 import net.dv8tion.jda.api.entities.channel.concrete.TextChannel;
 import scala.Option;
-import scala.collection.Iterator;
-import scala.collection.mutable.Map;
 import wowchat.common.Global$;
 import wowchat.game.GameCommandHandler;
 import wowchat.game.GamePacketHandler;
-import wowchat.game.GameResources$;
-import wowchat.game.GuildMember;
-import scala.runtime.BoxesRunTime;
 
 import java.io.File;
 import java.lang.reflect.Field;
 import java.util.*;
+import java.util.Arrays;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -184,8 +180,18 @@ public final class GuildOnlineListPublisher {
     // -------------------------------------------------------------------------
     // Get list of online guild member entries, formatted to match ?online output:
     //   "Symastic (40 Warrior in Stranglethorn Vale)"
-    // Uses the same Classes().valueOf() and GameResources$.AREA() lookups
-    // that GamePacketHandler.buildGuildiesOnline() uses for the ?online command.
+    //
+    // Delegates directly to GamePacketHandler.buildGuildiesOnline() which already
+    // handles all class name and zone name resolution correctly using the same
+    // Scala collection iterators as the rest of the bot. No reimplementation needed.
+    //
+    // buildGuildiesOnline() returns one of:
+    //   "Currently no guildies online."        — when empty (no newline)
+    //   "Currently 2 guildies online:\n        — when populated
+    //    Name1 (40 Warrior in Zone), Name2 (...)"
+    //
+    // We strip the header line, split the comma-separated entries into a List
+    // so tick() can sort them alphabetically and join with newlines.
     // -------------------------------------------------------------------------
 
     private static List<String> getOnlineNames() {
@@ -196,46 +202,26 @@ public final class GuildOnlineListPublisher {
             GameCommandHandler handler = gameOpt.get();
             if (!(handler instanceof GamePacketHandler)) return Collections.emptyList();
 
-            GamePacketHandler gameHandler = (GamePacketHandler) handler;
-            Map<Object, GuildMember> roster = gameHandler.guildRoster();
-            if (roster == null) return Collections.emptyList();
+            String raw = ((GamePacketHandler) handler).buildGuildiesOnline();
+            if (raw == null || raw.isEmpty()) return Collections.emptyList();
 
-            List<String> result = new ArrayList<>();
-            Iterator<GuildMember> it = roster.valuesIterator();
+            // No newline means "Currently no guildies online." — nothing to show
+            if (!raw.contains("\n")) return Collections.emptyList();
 
-            while (it.hasNext()) {
-                Object val = it.next();
-                if (!(val instanceof GuildMember)) continue;
+            // Strip the "Currently N guildies online:\n" header, split on ", "
+            String entriesPart = raw.substring(raw.indexOf('\n') + 1).trim();
+            if (entriesPart.isEmpty()) return Collections.emptyList();
 
-                GuildMember member = (GuildMember) val;
-                if (!member.isOnline()) continue;
+            List<String> result = new ArrayList<>(Arrays.asList(entriesPart.split(", ")));
 
-                String name = member.name();
-                if (name == null || name.trim().isEmpty()) continue;
-
-                String trimmed = name.trim();
-                if (!ignoreLower.isEmpty()
-                        && ignoreLower.contains(trimmed.toLowerCase(Locale.ROOT))) continue;
-
-                // Resolve class name — same call as GamePacketHandler.buildGuildiesOnline()
-                String className;
-                try {
-                    className = gameHandler.Classes().valueOf(member.charClass()).toString();
-                } catch (Throwable t) {
-                    className = "Unknown";
-                }
-
-                // Resolve zone name — same call as GamePacketHandler.buildGuildiesOnline()
-                String zoneName;
-                try {
-                    zoneName = (String) GameResources$.MODULE$.AREA()
-                        .getOrElse(BoxesRunTime.boxToInteger(member.zoneId()), () -> "Unknown Zone");
-                } catch (Throwable t) {
-                    zoneName = "Unknown Zone";
-                }
-
-                // Format: "Symastic (40 Warrior in Stranglethorn Vale)"
-                result.add(trimmed + " (" + member.level() + " " + className + " in " + zoneName + ")");
+            // Apply ignore list if configured
+            if (!ignoreLower.isEmpty()) {
+                result.removeIf(entry -> {
+                    // entry is "Name (40 Warrior in Zone)" — extract just the name
+                    int paren = entry.indexOf(" (");
+                    String name = paren > 0 ? entry.substring(0, paren) : entry;
+                    return ignoreLower.contains(name.trim().toLowerCase(Locale.ROOT));
+                });
             }
 
             return result;
