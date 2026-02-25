@@ -23,6 +23,10 @@
  *    Uses the same Classes().valueOf() and GameResources$.AREA() lookups
  *    that GamePacketHandler uses for ?online.
  *
+ * 6. Health file writer: writes lastRequestedGuildRoster() timestamp every 30s.
+ *    The Watchdog reads this file to detect dead WoW connections without
+ *    relying on log lines (which stop flowing during guild silence).
+ *
  * NOTE ON THE REFLECTION HACK:
  *    The JDA field in Discord.java is private with no public accessor. Since we're
  *    working with a decompiled JAR and can't modify Discord.java directly, reflection
@@ -41,8 +45,12 @@ import scala.Option;
 import wowchat.common.Global$;
 import wowchat.game.GameCommandHandler;
 import wowchat.game.GamePacketHandler;
+import wowchat.game.GameCommandHandler;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.lang.reflect.Field;
 import java.util.*;
 import java.util.Arrays;
@@ -57,6 +65,12 @@ public final class GuildOnlineListPublisher {
      * 10 zero-width spaces — same as original.
      */
     private static final String MARKER = "\u200b\u200b\u200b\u200b\u200b\u200b\u200b\u200b\u200b\u200b";
+
+    /** Health file path — Watchdog reads this to know WoW packets are still flowing. */
+    private static final String HEALTH_FILE = "watchdog.health";
+
+    /** How often we write the health file (seconds). */
+    private static final int HEALTH_WRITE_INTERVAL_SEC = 30;
 
     // Config values — loaded once at init()
     private static volatile long    channelId     = 0L;
@@ -98,7 +112,7 @@ public final class GuildOnlineListPublisher {
         scheduler = Executors.newSingleThreadScheduledExecutor(
             new DaemonThreadFactory("wowchat-online-list"));
 
-        long initialDelaySec = 30L;
+        long initialDelaySec = 5L;
         long periodSec       = Math.max(1, updateMinutes) * 60L;
 
         scheduler.scheduleAtFixedRate(() -> {
@@ -109,6 +123,45 @@ public final class GuildOnlineListPublisher {
                 System.err.println("[GuildOnlineList] Unexpected error in update tick: " + t.getMessage());
             }
         }, initialDelaySec, periodSec, TimeUnit.SECONDS);
+
+        // Health file writer — runs every 30s regardless of guild list update interval
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                writeHealthFile();
+            } catch (Throwable t) {
+                System.err.println("[GuildOnlineList] Error writing health file: " + t.getMessage());
+            }
+        }, 10L, HEALTH_WRITE_INTERVAL_SEC, TimeUnit.SECONDS);
+    }
+
+    // -------------------------------------------------------------------------
+    // Health file writer — called every 30s by the scheduler
+    //
+    // Writes the timestamp of the last WoW packet received to watchdog.health.
+    // The Watchdog reads this file to determine if the WoW connection is alive.
+    // If lastPacketReceivedMs is 0 (bot never connected), nothing is written.
+    // -------------------------------------------------------------------------
+
+    private static void writeHealthFile() {
+        try {
+            Option<GameCommandHandler> gameOpt = Global$.MODULE$.game();
+            if (gameOpt == null || gameOpt.isEmpty()) return;
+
+            GameCommandHandler handler = gameOpt.get();
+            if (!(handler instanceof GamePacketHandler)) return;
+
+            long lastRoster = ((GamePacketHandler) handler).lastRequestedGuildRoster();
+            if (lastRoster == 0L) return; // Bot hasn't connected to WoW yet
+
+            // Write the timestamp of the last guild roster request.
+            // The bot requests a fresh roster from the WoW server every 60s while connected.
+            // If this timestamp stops updating, the WoW connection is dead.
+            byte[] data = Long.toString(lastRoster).getBytes("UTF-8");
+            Files.write(Paths.get(HEALTH_FILE), data,
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (Throwable t) {
+            System.err.println("[GuildOnlineList] Failed to write health file: " + t.getMessage());
+        }
     }
 
     // -------------------------------------------------------------------------

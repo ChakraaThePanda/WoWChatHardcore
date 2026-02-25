@@ -4,28 +4,31 @@
  * ROOT CAUSE OF ORIGINAL BUG:
  *   CONNECTING_MARKERS fired on the very first "Connecting to realm server"
  *   log line at startup, setting lArray3[0] immediately. After exactly
- *   STUCK_TIMEOUT_SECONDS (360s) the condition (lArray3[0] > 0 && l3 >= 360)
- *   became true even on a perfectly healthy bot, killing it every 6 minutes.
+ *   STUCK_TIMEOUT_SECONDS (360s) the condition became true even on a perfectly
+ *   healthy bot, killing it every 6 minutes.
  *
- * FIX:
- *   The watchdog now uses a simple, clear state machine:
+ * FIX — FILE-BASED HEALTH CHECK:
+ *   Rather than relying on log lines (which stop flowing during guild silence),
+ *   the Watchdog reads a health file written by GuildOnlineListPublisher every
+ *   30 seconds. The file contains the timestamp of the last WoW packet received
+ *   by GamePacketHandler. This means:
  *
- *   State 1 — STARTING: bot just launched. We give it up to STARTUP_TIMEOUT_SECONDS
- *             to produce a healthy marker. If it never does, kill and restart.
+ *   - Guild silence does NOT trigger a restart (WoW keepalive packets still flow)
+ *   - Silent WoW server crash DOES trigger a restart (packets stop, file goes stale)
+ *   - Internet drop DOES trigger a restart (same)
+ *   - Bot hard crash DOES trigger a restart (file stops being written)
  *
- *   State 2 — HEALTHY: bot has logged in successfully. We reset a "last healthy"
- *             timestamp every time a healthy marker appears. The bot is only
- *             considered stuck if it has been UN-healthy for STUCK_TIMEOUT_SECONDS
- *             with no recovery. Normal operation never triggers this.
+ *   State 1 — STARTING: health file does not exist yet. We give the bot up to
+ *             STARTUP_TIMEOUT_SECONDS to create it. If it never does, restart.
  *
- *   State 3 — DISCONNECTED: bot printed "Disconnected from server!" — we give it
- *             RECONNECT_GRACE_SECONDS to reconnect on its own (it has internal
- *             reconnect logic). Only if it fails to recover within that window
- *             do we kill and restart.
+ *   State 2 — HEALTHY: health file exists and timestamp is recent (within
+ *             STALE_TIMEOUT_SECONDS). Normal operation.
+ *
+ *   State 3 — STALE: health file exists but timestamp is too old, OR file
+ *             has disappeared. Bot is dead or WoW connection is lost. Restart.
  *
  * NOTE: The bot already has internal reconnect logic in WoWChat$.java that
- * handles normal disconnects. The Watchdog is only a last resort for hard
- * crashes or completely stuck states.
+ * handles normal disconnects. The Watchdog is only a last resort.
  */
 package wowchat;
 
@@ -36,6 +39,8 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.lang.management.ManagementFactory;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -43,39 +48,29 @@ public final class WatchdogMain {
 
     private static final String CHILD_MAIN = "wowchat.WoWChat";
 
-    // Log line markers — must match what the bot actually prints
-    private static final String   MARK_DISCONNECTED  = "Disconnected from server!";
-    private static final String[] HEALTHY_MARKERS    = {
-        "Successfully joined the world!",
-        "Successfully logged in!",
-        "Connected! Authenticating...",
-        "Connected! Sending account login information..."
-    };
+    /** Health file written by GuildOnlineListPublisher every 30s. */
+    private static final String HEALTH_FILE = "watchdog.health";
 
     // Timing constants (all in seconds unless noted)
-    /** How long to wait for the bot to reach a healthy state on first startup. */
+    /**
+     * How long to wait for the health file to appear after startup.
+     * The bot needs time to connect to WoW before packets flow.
+     */
     private static final int STARTUP_TIMEOUT_SECONDS  = 120;
 
     /**
-     * After the bot has been healthy at least once, how long it can go without
-     * a healthy marker before we consider it stuck and kill it.
-     * Set generously — this should only fire for genuine hard hangs, not
-     * normal server restarts which the bot recovers from by itself.
+     * How old the health file timestamp can be before we consider the bot dead.
+     * The guild roster is requested every 60s, so 3 minutes allows 3 missed cycles.
+     * The file is written every 30s, so 3 minutes is very generous —
+     * it allows for up to 6 missed writes before triggering a restart.
      */
-    private static final int STUCK_TIMEOUT_SECONDS    = 600; // 10 minutes
-
-    /**
-     * After a "Disconnected from server!" line, how long we wait for the bot's
-     * own internal reconnect to succeed before we step in and kill/restart.
-     * The bot reconnects in 10s internally, so 120s is very generous.
-     */
-    private static final int RECONNECT_GRACE_SECONDS  = 120;
+    private static final int STALE_TIMEOUT_SECONDS    = 180; // 3 minutes
 
     /** Delay between watchdog kill and restarting the child process. */
     private static final int RESTART_DELAY_SECONDS    = 30;
 
-    /** How often the watchdog checks the child process state. */
-    private static final int CHECK_INTERVAL_MS        = 3000;
+    /** How often the watchdog checks the health file. */
+    private static final int CHECK_INTERVAL_MS        = 10000; // 10 seconds
 
     public static void main(String[] args) throws Exception {
         boolean echoToConsole = System.console() != null;
@@ -84,45 +79,21 @@ public final class WatchdogMain {
         System.out.println("[Watchdog] Starting. Will manage: " + CHILD_MAIN);
 
         while (true) {
-            // --- Shared state arrays (long[] so lambdas can write to them) ---
-            // [0] = timestamp of last healthy log line (-1 = never seen)
-            final long[] lastHealthyTime    = { -1L };
-            // [0] = timestamp of "Disconnected from server!" line (-1 = not seen)
-            final long[] disconnectedTime   = { -1L };
-            // [0] = System.currentTimeMillis() when process was started
-            final long[] startTime          = { System.currentTimeMillis() };
+            long startTime = System.currentTimeMillis();
+
+            // Delete any stale health file from a previous run
+            try { Files.deleteIfExists(Paths.get(HEALTH_FILE)); } catch (Throwable ignored) {}
 
             Process process = startChildProcess(jarFile, args);
             System.out.println("[Watchdog] Child process started (PID tracking not available in Java 8).");
 
-            // Pump stdout — update state based on log lines
+            // Pump stdout and stderr — just echo to console, no state tracking needed
+            // Health is determined entirely by the health file, not log lines
             Thread stdoutThread = new Thread(new StreamPump(
-                process.getInputStream(),
-                echoToConsole,
-                line -> {
-                    if (line == null) return;
-
-                    if (containsAny(line, HEALTHY_MARKERS)) {
-                        // Bot is alive and well — reset healthy timestamp and clear disconnect flag
-                        lastHealthyTime[0]  = System.currentTimeMillis();
-                        disconnectedTime[0] = -1L; // recovered from disconnect
-                    }
-
-                    if (line.contains(MARK_DISCONNECTED)) {
-                        // Record when the disconnect happened
-                        // Only set if not already set (so we track first disconnect time)
-                        if (disconnectedTime[0] < 0L) {
-                            disconnectedTime[0] = System.currentTimeMillis();
-                        }
-                    }
-                }
+                process.getInputStream(), echoToConsole, line -> {}
             ), "watchdog-stdout");
-
-            // Pump stderr — just echo it, no state changes needed
             Thread stderrThread = new Thread(new StreamPump(
-                process.getErrorStream(),
-                echoToConsole,
-                line -> { /* stderr: no state tracking needed */ }
+                process.getErrorStream(), echoToConsole, line -> {}
             ), "watchdog-stderr");
 
             stdoutThread.setDaemon(true);
@@ -141,42 +112,45 @@ public final class WatchdogMain {
                     shouldRestart = true;
                     break;
                 } catch (IllegalThreadStateException e) {
-                    // Process still running — check health
+                    // Process still running — check health file
                 }
 
-                long now        = System.currentTimeMillis();
-                long uptime     = (now - startTime[0]) / 1000L;
-                long sinceHealthy = lastHealthyTime[0] < 0L
-                    ? uptime                                        // never been healthy: use uptime
-                    : (now - lastHealthyTime[0]) / 1000L;          // time since last healthy
+                long now    = System.currentTimeMillis();
+                long uptime = (now - startTime) / 1000L;
 
-                // CASE 1: Never reached a healthy state — startup timeout
-                if (lastHealthyTime[0] < 0L && uptime > STARTUP_TIMEOUT_SECONDS) {
-                    System.out.println("[Watchdog] Bot never reached a healthy state in "
-                        + STARTUP_TIMEOUT_SECONDS + "s. Killing and restarting.");
-                    shouldRestart = true;
-                    break;
-                }
+                File healthFile = new File(HEALTH_FILE);
 
-                // CASE 2: Was healthy before, now has been unhealthy for too long
-                // (covers hard crashes, infinite loops, etc.)
-                if (lastHealthyTime[0] >= 0L && sinceHealthy > STUCK_TIMEOUT_SECONDS) {
-                    System.out.println("[Watchdog] Bot has been unhealthy for " + sinceHealthy
-                        + "s (limit: " + STUCK_TIMEOUT_SECONDS + "s). Killing and restarting.");
-                    shouldRestart = true;
-                    break;
-                }
-
-                // CASE 3: Disconnected and bot failed to reconnect within grace period
-                if (disconnectedTime[0] >= 0L) {
-                    long sinceDisconnect = (now - disconnectedTime[0]) / 1000L;
-                    if (sinceDisconnect > RECONNECT_GRACE_SECONDS) {
-                        System.out.println("[Watchdog] Bot disconnected " + sinceDisconnect
-                            + "s ago and has not recovered (limit: " + RECONNECT_GRACE_SECONDS
-                            + "s). Killing and restarting.");
+                // CASE 1: Health file doesn't exist yet — bot hasn't connected to WoW
+                if (!healthFile.exists()) {
+                    if (uptime > STARTUP_TIMEOUT_SECONDS) {
+                        System.out.println("[Watchdog] Bot never created health file in "
+                            + STARTUP_TIMEOUT_SECONDS + "s. Killing and restarting.");
                         shouldRestart = true;
                         break;
                     }
+                    // Still within startup window — keep waiting
+                    Thread.sleep(CHECK_INTERVAL_MS);
+                    continue;
+                }
+
+                // CASE 2: Health file exists — read the last WoW packet timestamp
+                long lastPacketMs = 0L;
+                try {
+                    String raw = new String(Files.readAllBytes(Paths.get(HEALTH_FILE)), "UTF-8").trim();
+                    lastPacketMs = Long.parseLong(raw);
+                } catch (Throwable t) {
+                    System.err.println("[Watchdog] Could not read health file: " + t.getMessage());
+                    Thread.sleep(CHECK_INTERVAL_MS);
+                    continue;
+                }
+
+                long staleSeconds = (now - lastPacketMs) / 1000L;
+                if (staleSeconds > STALE_TIMEOUT_SECONDS) {
+                    System.out.println("[Watchdog] Health file is stale by " + staleSeconds
+                        + "s (limit: " + STALE_TIMEOUT_SECONDS + "s). "
+                        + "WoW connection appears dead. Killing and restarting.");
+                    shouldRestart = true;
+                    break;
                 }
 
                 Thread.sleep(CHECK_INTERVAL_MS);
@@ -199,13 +173,6 @@ public final class WatchdogMain {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
-
-    private static boolean containsAny(String line, String[] markers) {
-        for (String marker : markers) {
-            if (line.contains(marker)) return true;
-        }
-        return false;
-    }
 
     private static Process startChildProcess(File jarFile, String[] args) throws IOException {
         String java = findJavaExecutable();
