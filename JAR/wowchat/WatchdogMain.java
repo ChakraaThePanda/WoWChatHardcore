@@ -1,5 +1,31 @@
 /*
- * Decompiled with CFR 0.152.
+ * WatchdogMain.java — rewritten to fix the 6-minute restart bug.
+ *
+ * ROOT CAUSE OF ORIGINAL BUG:
+ *   CONNECTING_MARKERS fired on the very first "Connecting to realm server"
+ *   log line at startup, setting lArray3[0] immediately. After exactly
+ *   STUCK_TIMEOUT_SECONDS (360s) the condition (lArray3[0] > 0 && l3 >= 360)
+ *   became true even on a perfectly healthy bot, killing it every 6 minutes.
+ *
+ * FIX:
+ *   The watchdog now uses a simple, clear state machine:
+ *
+ *   State 1 — STARTING: bot just launched. We give it up to STARTUP_TIMEOUT_SECONDS
+ *             to produce a healthy marker. If it never does, kill and restart.
+ *
+ *   State 2 — HEALTHY: bot has logged in successfully. We reset a "last healthy"
+ *             timestamp every time a healthy marker appears. The bot is only
+ *             considered stuck if it has been UN-healthy for STUCK_TIMEOUT_SECONDS
+ *             with no recovery. Normal operation never triggers this.
+ *
+ *   State 3 — DISCONNECTED: bot printed "Disconnected from server!" — we give it
+ *             RECONNECT_GRACE_SECONDS to reconnect on its own (it has internal
+ *             reconnect logic). Only if it fails to recover within that window
+ *             do we kill and restart.
+ *
+ * NOTE: The bot already has internal reconnect logic in WoWChat$.java that
+ * handles normal disconnects. The Watchdog is only a last resort for hard
+ * crashes or completely stuck states.
  */
 package wowchat;
 
@@ -14,198 +40,245 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class WatchdogMain {
+
     private static final String CHILD_MAIN = "wowchat.WoWChat";
-    private static final String MARK_DISCONNECTED = "Disconnected from server!";
-    private static final String[] HEALTHY_MARKERS = new String[]{"Successfully joined the world!", "Successfully logged in!", "Connected! Authenticating...", "Connected! Sending account login information..."};
-    private static final String[] CONNECTING_MARKERS = new String[]{"Connecting", "Reconnecting", "Attempting to connect", "Trying to connect"};
-    private static final int RESTART_DELAY_SECONDS = 30;
-    private static final int STUCK_TIMEOUT_SECONDS = 360;
-    private static final int MIN_DISCONNECT_GRACE_SECONDS = 30;
-    private static final int CHECK_INTERVAL_MS = 2000;
 
-    public static void main(String[] stringArray) throws Exception {
-        boolean bl = System.console() != null;
-        File file = WatchdogMain.getCurrentJarFile();
+    // Log line markers — must match what the bot actually prints
+    private static final String   MARK_DISCONNECTED  = "Disconnected from server!";
+    private static final String[] HEALTHY_MARKERS    = {
+        "Successfully joined the world!",
+        "Successfully logged in!",
+        "Connected! Authenticating...",
+        "Connected! Sending account login information..."
+    };
+
+    // Timing constants (all in seconds unless noted)
+    /** How long to wait for the bot to reach a healthy state on first startup. */
+    private static final int STARTUP_TIMEOUT_SECONDS  = 120;
+
+    /**
+     * After the bot has been healthy at least once, how long it can go without
+     * a healthy marker before we consider it stuck and kill it.
+     * Set generously — this should only fire for genuine hard hangs, not
+     * normal server restarts which the bot recovers from by itself.
+     */
+    private static final int STUCK_TIMEOUT_SECONDS    = 600; // 10 minutes
+
+    /**
+     * After a "Disconnected from server!" line, how long we wait for the bot's
+     * own internal reconnect to succeed before we step in and kill/restart.
+     * The bot reconnects in 10s internally, so 120s is very generous.
+     */
+    private static final int RECONNECT_GRACE_SECONDS  = 120;
+
+    /** Delay between watchdog kill and restarting the child process. */
+    private static final int RESTART_DELAY_SECONDS    = 30;
+
+    /** How often the watchdog checks the child process state. */
+    private static final int CHECK_INTERVAL_MS        = 3000;
+
+    public static void main(String[] args) throws Exception {
+        boolean echoToConsole = System.console() != null;
+        File jarFile = getCurrentJarFile();
+
+        System.out.println("[Watchdog] Starting. Will manage: " + CHILD_MAIN);
+
         while (true) {
-            long l = System.currentTimeMillis();
-            long[] lArray = new long[]{l};
-            long[] lArray2 = new long[]{-1L};
-            long[] lArray3 = new long[]{-1L};
-            Process process = WatchdogMain.startChildProcess(file, stringArray);
-            Thread thread2 = new Thread((Runnable)new StreamPump(process.getInputStream(), bl, new LineObserver(){
+            // --- Shared state arrays (long[] so lambdas can write to them) ---
+            // [0] = timestamp of last healthy log line (-1 = never seen)
+            final long[] lastHealthyTime    = { -1L };
+            // [0] = timestamp of "Disconnected from server!" line (-1 = not seen)
+            final long[] disconnectedTime   = { -1L };
+            // [0] = System.currentTimeMillis() when process was started
+            final long[] startTime          = { System.currentTimeMillis() };
 
-                @Override
-                public void onLine(String string) {
-                    if (string == null) {
-                        return;
-                    }
-                    if (WatchdogMain.containsAny(string, HEALTHY_MARKERS)) {
-                        lArray[0] = System.currentTimeMillis();
-                    }
-                    if (string.contains(WatchdogMain.MARK_DISCONNECTED)) {
-                        lArray2[0] = System.currentTimeMillis();
-                    }
-                    if (WatchdogMain.containsAny(string, CONNECTING_MARKERS)) {
-                        lArray3[0] = System.currentTimeMillis();
-                    }
-                }
-            }), "watchdog-stdout");
-            Thread thread3 = new Thread((Runnable)new StreamPump(process.getErrorStream(), bl, new LineObserver(){
+            Process process = startChildProcess(jarFile, args);
+            System.out.println("[Watchdog] Child process started (PID tracking not available in Java 8).");
 
-                @Override
-                public void onLine(String string) {
-                }
-            }), "watchdog-stderr");
-            thread2.setDaemon(true);
-            thread3.setDaemon(true);
-            thread2.start();
-            thread3.start();
-            boolean bl2 = false;
-            while (true) {
-                try {
-                    process.exitValue();
-                    bl2 = true;
-                }
-                catch (IllegalThreadStateException illegalThreadStateException) {
-                    long l2 = System.currentTimeMillis();
-                    long l3 = (l2 - lArray[0]) / 1000L;
-                    if (lArray2[0] > 0L) {
-                        long l4 = (l2 - lArray2[0]) / 1000L;
-                        if (l4 > 30L && l3 >= 360L) {
-                            bl2 = true;
-                            break;
+            // Pump stdout — update state based on log lines
+            Thread stdoutThread = new Thread(new StreamPump(
+                process.getInputStream(),
+                echoToConsole,
+                line -> {
+                    if (line == null) return;
+
+                    if (containsAny(line, HEALTHY_MARKERS)) {
+                        // Bot is alive and well — reset healthy timestamp and clear disconnect flag
+                        lastHealthyTime[0]  = System.currentTimeMillis();
+                        disconnectedTime[0] = -1L; // recovered from disconnect
+                    }
+
+                    if (line.contains(MARK_DISCONNECTED)) {
+                        // Record when the disconnect happened
+                        // Only set if not already set (so we track first disconnect time)
+                        if (disconnectedTime[0] < 0L) {
+                            disconnectedTime[0] = System.currentTimeMillis();
                         }
-                    } else if (lArray3[0] > 0L && l3 >= 360L) {
-                        bl2 = true;
+                    }
+                }
+            ), "watchdog-stdout");
+
+            // Pump stderr — just echo it, no state changes needed
+            Thread stderrThread = new Thread(new StreamPump(
+                process.getErrorStream(),
+                echoToConsole,
+                line -> { /* stderr: no state tracking needed */ }
+            ), "watchdog-stderr");
+
+            stdoutThread.setDaemon(true);
+            stderrThread.setDaemon(true);
+            stdoutThread.start();
+            stderrThread.start();
+
+            // --- Watchdog monitoring loop ---
+            boolean shouldRestart = false;
+
+            while (true) {
+                // Check if process exited on its own
+                try {
+                    int exitCode = process.exitValue();
+                    System.out.println("[Watchdog] Child process exited with code " + exitCode + ". Will restart.");
+                    shouldRestart = true;
+                    break;
+                } catch (IllegalThreadStateException e) {
+                    // Process still running — check health
+                }
+
+                long now        = System.currentTimeMillis();
+                long uptime     = (now - startTime[0]) / 1000L;
+                long sinceHealthy = lastHealthyTime[0] < 0L
+                    ? uptime                                        // never been healthy: use uptime
+                    : (now - lastHealthyTime[0]) / 1000L;          // time since last healthy
+
+                // CASE 1: Never reached a healthy state — startup timeout
+                if (lastHealthyTime[0] < 0L && uptime > STARTUP_TIMEOUT_SECONDS) {
+                    System.out.println("[Watchdog] Bot never reached a healthy state in "
+                        + STARTUP_TIMEOUT_SECONDS + "s. Killing and restarting.");
+                    shouldRestart = true;
+                    break;
+                }
+
+                // CASE 2: Was healthy before, now has been unhealthy for too long
+                // (covers hard crashes, infinite loops, etc.)
+                if (lastHealthyTime[0] >= 0L && sinceHealthy > STUCK_TIMEOUT_SECONDS) {
+                    System.out.println("[Watchdog] Bot has been unhealthy for " + sinceHealthy
+                        + "s (limit: " + STUCK_TIMEOUT_SECONDS + "s). Killing and restarting.");
+                    shouldRestart = true;
+                    break;
+                }
+
+                // CASE 3: Disconnected and bot failed to reconnect within grace period
+                if (disconnectedTime[0] >= 0L) {
+                    long sinceDisconnect = (now - disconnectedTime[0]) / 1000L;
+                    if (sinceDisconnect > RECONNECT_GRACE_SECONDS) {
+                        System.out.println("[Watchdog] Bot disconnected " + sinceDisconnect
+                            + "s ago and has not recovered (limit: " + RECONNECT_GRACE_SECONDS
+                            + "s). Killing and restarting.");
+                        shouldRestart = true;
                         break;
                     }
-                    Thread.sleep(2000L);
-                    continue;
                 }
-                break;
+
+                Thread.sleep(CHECK_INTERVAL_MS);
             }
-            if (!bl2) continue;
-            try {
-                process.destroy();
-            }
-            catch (Throwable throwable) {
-                // empty catch block
-            }
-            try {
-                Thread.sleep(2000L);
-            }
-            catch (Throwable throwable) {
-                // empty catch block
-            }
-            try {
-                process.destroyForcibly();
-            }
-            catch (Throwable throwable) {
-                // empty catch block
-            }
-            Thread.sleep(30000L);
+
+            if (!shouldRestart) continue;
+
+            // --- Kill the child process cleanly ---
+            System.out.println("[Watchdog] Stopping child process...");
+            try { process.destroy(); } catch (Throwable ignored) {}
+            try { Thread.sleep(2000); } catch (Throwable ignored) {}
+            try { process.destroyForcibly(); } catch (Throwable ignored) {}
+
+            System.out.println("[Watchdog] Waiting " + RESTART_DELAY_SECONDS + "s before restarting...");
+            Thread.sleep(RESTART_DELAY_SECONDS * 1000L);
+            System.out.println("[Watchdog] Restarting child process.");
         }
     }
 
-    private static boolean containsAny(String string, String[] stringArray) {
-        for (int i = 0; i < stringArray.length; ++i) {
-            if (!string.contains(stringArray[i])) continue;
-            return true;
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    private static boolean containsAny(String line, String[] markers) {
+        for (String marker : markers) {
+            if (line.contains(marker)) return true;
         }
         return false;
     }
 
-    private static Process startChildProcess(File file, String[] stringArray) throws IOException {
-        String string = WatchdogMain.findJavaExecutable();
-        ArrayList<String> arrayList = new ArrayList<String>();
-        arrayList.add(string);
-        List<String> list = ManagementFactory.getRuntimeMXBean().getInputArguments();
-        for (String string2 : list) {
-            if ("-jar".equals(string2)) continue;
-            arrayList.add(string2);
+    private static Process startChildProcess(File jarFile, String[] args) throws IOException {
+        String java = findJavaExecutable();
+        List<String> cmd = new ArrayList<>();
+        cmd.add(java);
+
+        // Pass through JVM flags (e.g. -Xmx) but skip -jar since we use -cp
+        for (String arg : ManagementFactory.getRuntimeMXBean().getInputArguments()) {
+            if (!"-jar".equals(arg)) cmd.add(arg);
         }
-        arrayList.add("-cp");
-        arrayList.add(file.getAbsolutePath());
-        arrayList.add(CHILD_MAIN);
-        if (stringArray != null) {
-            for (int i = 0; i < stringArray.length; ++i) {
-                arrayList.add(stringArray[i]);
-            }
+
+        cmd.add("-cp");
+        cmd.add(jarFile.getAbsolutePath());
+        cmd.add(CHILD_MAIN);
+
+        if (args != null) {
+            for (String arg : args) cmd.add(arg);
         }
-        ProcessBuilder processBuilder = new ProcessBuilder(arrayList);
-        processBuilder.directory(file.getParentFile());
-        processBuilder.redirectErrorStream(false);
-        return processBuilder.start();
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.directory(jarFile.getParentFile());
+        pb.redirectErrorStream(false);
+        return pb.start();
     }
 
     private static File getCurrentJarFile() throws Exception {
-        String string = WatchdogMain.class.getProtectionDomain().getCodeSource().getLocation().getPath();
-        string = string.replace("%20", " ");
-        return new File(string).getAbsoluteFile();
+        String path = WatchdogMain.class.getProtectionDomain()
+            .getCodeSource().getLocation().getPath();
+        path = path.replace("%20", " ");
+        return new File(path).getAbsoluteFile();
     }
 
     private static String findJavaExecutable() {
-        String string = System.getProperty("java.home");
-        File file = new File(string, "bin");
-        File file2 = new File(file, WatchdogMain.isWindows() ? "java.exe" : "java");
-        if (file2.exists()) {
-            return file2.getAbsolutePath();
-        }
-        return "java";
+        File javaHome = new File(System.getProperty("java.home"), "bin");
+        File javaExe  = new File(javaHome, isWindows() ? "java.exe" : "java");
+        return javaExe.exists() ? javaExe.getAbsolutePath() : "java";
     }
 
     private static boolean isWindows() {
-        String string = System.getProperty("os.name");
-        return string != null && string.toLowerCase().contains("win");
+        String os = System.getProperty("os.name");
+        return os != null && os.toLowerCase().contains("win");
     }
 
-    private static final class StreamPump
-    implements Runnable {
-        private final InputStream in;
-        private final boolean echo;
+    // -------------------------------------------------------------------------
+    // StreamPump — reads a process stream line by line and notifies an observer
+    // -------------------------------------------------------------------------
+
+    @FunctionalInterface
+    private interface LineObserver {
+        void onLine(String line);
+    }
+
+    private static final class StreamPump implements Runnable {
+        private final InputStream  in;
+        private final boolean      echo;
         private final LineObserver observer;
 
-        StreamPump(InputStream inputStream2, boolean bl, LineObserver lineObserver) {
-            this.in = inputStream2;
-            this.echo = bl;
-            this.observer = lineObserver;
+        StreamPump(InputStream in, boolean echo, LineObserver observer) {
+            this.in       = in;
+            this.echo     = echo;
+            this.observer = observer;
         }
 
-        /*
-         * WARNING - Removed try catching itself - possible behaviour change.
-         */
         @Override
         public void run() {
-            BufferedReader bufferedReader = null;
-            try {
-                String string;
-                bufferedReader = new BufferedReader(new InputStreamReader(this.in, Charset.forName("UTF-8")));
-                while ((string = bufferedReader.readLine()) != null) {
-                    try {
-                        this.observer.onLine(string);
-                    }
-                    catch (Throwable throwable) {
-                        // empty catch block
-                    }
-                    if (!this.echo) continue;
-                    System.out.println(string);
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(in, Charset.forName("UTF-8")))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    try { observer.onLine(line); } catch (Throwable ignored) {}
+                    if (echo) System.out.println(line);
                 }
-            }
-            catch (Throwable throwable) {
-            }
-            finally {
-                try {
-                    if (bufferedReader != null) {
-                        bufferedReader.close();
-                    }
-                }
-                catch (Throwable throwable) {}
-            }
+            } catch (Throwable ignored) {}
         }
     }
-
-    private static interface LineObserver {
-        public void onLine(String var1);
-    }
 }
-
