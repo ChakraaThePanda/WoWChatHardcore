@@ -164,7 +164,7 @@ public final class GuildOnlineListPublisher {
 
     // -------------------------------------------------------------------------
     // Status rotation — cycles through guildStatusMessages on a fixed timer.
-    // Replaces {count} with the current number of online guild members.
+    // Replaces {online-members} with "N Guild Member" or "N Guild Members" (pluralized).
     // Calls Discord.changeGuildStatus() directly, same as the bot does internally.
     // -------------------------------------------------------------------------
 
@@ -175,11 +175,12 @@ public final class GuildOnlineListPublisher {
         String template = statusMessages.get(statusIndex % statusMessages.size());
         statusIndex++;
 
-        // Resolve {count} if present
+        // Resolve {online-members} if present — returns "1 Guild Member" or "N Guild Members"
         String message = template;
-        if (message.contains("{count}")) {
+        if (message.contains("{online-members}")) {
             int count = getOnlineCount();
-            message = message.replace("{count}", String.valueOf(count));
+            String membersLabel = count == 1 ? "1 Guild Member" : count + " Guild Members";
+            message = message.replace("{online-members}", membersLabel);
         }
 
         // Push to Discord presence
@@ -198,9 +199,9 @@ public final class GuildOnlineListPublisher {
             GameCommandHandler handler = gameOpt.get();
             if (!(handler instanceof GamePacketHandler)) return 0;
             // buildGuildiesOnline() excludes the bot character, same as ?online
-            // getGuildiesOnlineMessage(true) returns "N guildies online" — parse the count from there
+            // getGuildiesOnlineMessage(true) returns "N Guild Members online" — parse the count from there
             String msg = ((GamePacketHandler) handler).getGuildiesOnlineMessage(true);
-            // format: "N guildies online" or "1 guildie online"
+            // format: "N Guild Members online" or "1 Guild Member online"
             String[] parts = msg.split(" ");
             if (parts.length > 0) return Integer.parseInt(parts[0]);
         } catch (Throwable t) {
@@ -253,7 +254,7 @@ public final class GuildOnlineListPublisher {
         List<String> onlineNames = getOnlineNames();
         Collections.sort(onlineNames, String.CASE_INSENSITIVE_ORDER);
 
-        String payload = onlineNames.isEmpty() ? "No Guildies Online" : String.join("\n", onlineNames);
+        String payload = onlineNames.isEmpty() ? "No Guild Members Online" : String.join("\n", onlineNames);
 
         // Find our existing message if we don't have its ID cached
         if (messageId == null) {
@@ -306,7 +307,7 @@ public final class GuildOnlineListPublisher {
     // Scala collection iterators as the rest of the bot. No reimplementation needed.
     //
     // buildGuildiesOnline() returns one of:
-    //   "Currently no guildies online."        — when empty (no newline)
+    //   "Currently no Guild Members online."   — when empty (no newline)
     //   "Currently 2 guildies online:\n        — when populated
     //    Name1 (40 Warrior in Zone), Name2 (...)"
     //
@@ -325,7 +326,7 @@ public final class GuildOnlineListPublisher {
             String raw = ((GamePacketHandler) handler).buildGuildiesOnline();
             if (raw == null || raw.isEmpty()) return Collections.emptyList();
 
-            // No newline means "Currently no guildies online." — nothing to show
+            // No newline means "Currently no Guild Members online." — nothing to show
             if (!raw.contains("\n")) return Collections.emptyList();
 
             // Strip the "Currently N guildies online:\n" header, split on ", "

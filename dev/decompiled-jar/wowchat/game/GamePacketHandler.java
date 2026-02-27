@@ -701,8 +701,8 @@ StrictLogging {
 
     public String getGuildiesOnlineMessage(boolean isStatus) {
         int size = this.guildRoster().count((Function1<Tuple2, Object> & Serializable & scala.Serializable)x$3 -> BoxesRunTime.boxToBoolean(GamePacketHandler.$anonfun$getGuildiesOnlineMessage$1(x$3))) - 1;
-        String guildies = new StringBuilder(7).append("guildie").append((Object)(size != 1 ? "s" : "")).toString();
-        return isStatus ? new StringBuilder(8).append(size).append(" ").append(guildies).append(" online").toString() : (size <= 0 ? "Currently no guildies online." : new StringBuilder(20).append("Currently ").append(size).append(" ").append(guildies).append(" online:\n").toString());
+        String guildies = new StringBuilder(12).append("Guild Member").append((Object)(size != 1 ? "s" : "")).toString();
+        return isStatus ? new StringBuilder(13).append(size).append(" ").append(guildies).append(" online").toString() : (size <= 0 ? "Currently no Guild Members online." : new StringBuilder(25).append("Currently ").append(size).append(" ").append(guildies).append(" online:\n").toString());
     }
 
     public void updateGuildiesOnline() {
