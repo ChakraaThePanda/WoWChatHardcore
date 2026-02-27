@@ -494,6 +494,10 @@ public final class GuildOnlineListPublisher {
             updateMinutes = 5;
             ignoreLower   = Collections.emptySet();
         }
+
+        // Register DM auto-reply handler
+        String configFile = System.getProperty("wowchat.configFile", "wowchat.conf");
+        DiscordDMHandler.register(configFile);
     }
 
     // -------------------------------------------------------------------------
